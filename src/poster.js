@@ -26,9 +26,9 @@ function escapeXml(s) {
  */
 function buildBadgeSvg(width, height, rating) {
   // Scale the badge to the poster width so it looks right at any resolution.
-  const pad = Math.round(width * 0.04);
-  const fontSize = Math.round(width * 0.16);
-  const labelSize = Math.round(width * 0.052);
+  const pad = Math.round(width * 0.045);
+  const fontSize = Math.round(width * 0.20);
+  const labelSize = Math.round(width * 0.072);
   const pillH = Math.round(fontSize * 1.18);
   const text = `${Math.round(rating)}%`;
   // Rough width estimate for the pill (digits are ~0.62em wide here).
