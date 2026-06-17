@@ -1,3 +1,4 @@
-node_modules
-*.jpg
-.git
+node_modules/
+*.log
+test_poster_*.jpg
+e2e_poster.jpg
