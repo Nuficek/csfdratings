@@ -16,7 +16,7 @@ module.exports = {
   PORT,
   BASE_URL,
   CINEMETA: 'https://v3-cinemeta.strem.io',
-  POSTER_WIDTH: parseInt(process.env.POSTER_WIDTH || '500', 10),
+  POSTER_WIDTH: parseInt(process.env.POSTER_WIDTH || '600', 10),
 
   // Cache lifetimes (ms)
   TTL_MAPPING: 1000 * 60 * 60 * 24 * 30, // imdb -> csfd id basically never changes
