@@ -1,83 +1,95 @@
 'use strict';
 
-const express = require('express');
-const { getRouter } = require('stremio-addon-sdk');
-
-const { PORT, BASE_URL, POSTER_WIDTH, TTL_POSTER } = require('./config');
-const addonInterface = require('./addon');
+const { addonBuilder } = require('stremio-addon-sdk');
+const { BASE_URL } = require('./config');
 const cinemeta = require('./cinemeta');
 const { getRating } = require('./csfd');
-const { buildPoster } = require('./poster');
-const { TTLCache } = require('./cache');
 
-const app = express();
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  next();
+const pkg = require('../package.json');
+
+// Which Cinemeta catalog each of our catalogs mirrors.
+// Add more rows here to expose additional ČSFD-rated catalogs.
+const CATALOG_MAP = {
+  'csfd.top': 'top', // Cinemeta "Popular"
+};
+
+const sharedExtra = [
+  { name: 'genre', isRequired: false },
+  { name: 'skip', isRequired: false },
+  { name: 'search', isRequired: false },
+];
+
+const manifest = {
+  id: 'community.csfd.ratings.posters',
+  version: pkg.version,
+  name: 'ČSFD Ratings',
+  description:
+    'Adds ČSFD (csfd.cz) ratings onto movie and series posters, in the style of rating-poster addons. ' +
+    'Mirrors Cinemeta catalogs and overlays the ČSFD percentage rating on each poster.',
+  logo: 'https://www.csfd.cz/favicon.ico',
+  resources: ['catalog', 'meta'],
+  types: ['movie', 'series'],
+  idPrefixes: ['tt'],
+  catalogs: [
+    { type: 'movie', id: 'csfd.top', name: 'ČSFD Popular', extra: sharedExtra },
+    { type: 'series', id: 'csfd.top', name: 'ČSFD Popular', extra: sharedExtra },
+  ],
+  behaviorHints: { configurable: false, configurationRequired: false },
+};
+
+const builder = new addonBuilder(manifest);
+
+function posterUrl(type, id) {
+  return `${BASE_URL}/poster/${type}/${encodeURIComponent(id)}.jpg`;
+}
+
+// --- Catalog ----------------------------------------------------------------
+// Fast: we only rewrite poster URLs to point at our renderer. The actual ČSFD
+// lookup + composite happens lazily when Stremio requests each poster image.
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
+  const cinemetaId = CATALOG_MAP[id];
+  if (!cinemetaId) return { metas: [] };
+
+  const { metas } = await cinemeta.getCatalog(type, cinemetaId, extra);
+  const out = metas.map((m) => ({
+    ...m,
+    poster: m.id && m.id.startsWith('tt') ? posterUrl(type, m.id) : m.poster,
+    posterShape: 'poster',
+  }));
+  return { metas: out };
 });
 
-const posterCache = new TTLCache(4000); // key -> {buf, ct}
+// --- Meta -------------------------------------------------------------------
+// On the detail page we can afford one ČSFD lookup: rewrite the poster and add
+// the rating + a link to the ČSFD page into the description.
+builder.defineMetaHandler(async ({ type, id }) => {
+  const meta = await cinemeta.getMeta(type, id);
+  if (!meta) return { meta: null };
 
-// /poster/:type/:id.jpg  -> original poster with ČSFD rating badge composited
-app.get('/poster/:type/:file', async (req, res) => {
-  const { type } = req.params;
-  const id = req.params.file.replace(/\.(jpg|jpeg|png)$/i, '');
-  const cacheKey = `${type}:${id}`;
-
+  const year = cinemeta.parseYear(meta.year || meta.releaseInfo);
+  let rating = null;
+  let url = null;
   try {
-    const cached = posterCache.get(cacheKey);
-    if (cached) {
-      res.setHeader('Cache-Control', 'public, max-age=86400');
-      res.setHeader('Content-Type', cached.ct);
-      return res.end(cached.buf);
-    }
+    const r = await getRating(type, id, meta.name, year);
+    rating = r.rating;
+    url = r.url;
+  } catch (_) { /* fall back to plain meta */ }
 
-    const info = await cinemeta.getInfo(type, id);
-    if (!info || !info.poster) return res.status(404).end('no source poster');
+  const enriched = {
+    ...meta,
+    poster: posterUrl(type, id),
+  };
 
-    let rating = null;
-    try {
-      const r = await getRating(type, id, info.title, info.year);
-      rating = r.rating;
-    } catch (_) { /* render plain poster on lookup failure */ }
-
-    const buf = await buildPoster(info.poster, rating, POSTER_WIDTH);
-    posterCache.set(cacheKey, { buf, ct: 'image/jpeg' }, TTL_POSTER);
-
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.setHeader('Content-Type', 'image/jpeg');
-    return res.end(buf);
-  } catch (e) {
-    // Last-resort: redirect to the original Cinemeta poster so Stremio still
-    // shows *something* instead of a broken image.
-    try {
-      const info = await cinemeta.getInfo(type, id);
-      if (info && info.poster) return res.redirect(302, info.poster);
-    } catch (_) { /* ignore */ }
-    return res.status(502).end('poster error');
+  if (rating !== null && rating !== undefined) {
+    const line = `★ ČSFD: ${Math.round(rating)} %`;
+    enriched.description = `${line}\n\n${meta.description || ''}`.trim();
+    enriched.links = [
+      ...(meta.links || []),
+      ...(url ? [{ name: `ČSFD ${Math.round(rating)} %`, category: 'ČSFD', url }] : []),
+    ];
   }
+  return { meta: enriched };
 });
 
-app.get('/', (_req, res) => {
-  const install = `${BASE_URL}/manifest.json`;
-  const deep = install.replace(/^https?:\/\//, 'stremio://');
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.end(`<!doctype html><meta charset="utf-8">
-<title>ČSFD Ratings — Stremio addon</title>
-<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:48px auto;padding:0 16px;line-height:1.5}
-a.btn{display:inline-block;background:#b81e1e;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:700}
-code{background:#f2f2f2;padding:2px 6px;border-radius:4px}</style>
-<h1>ČSFD Ratings</h1>
-<p>Adds <strong>ČSFD</strong> ratings onto movie &amp; series posters in Stremio.</p>
-<p><a class="btn" href="${deep}">Install in Stremio</a></p>
-<p>Or paste this URL into Stremio &rarr; Addons &rarr; <em>Add addon</em>:</p>
-<p><code>${install}</code></p>`);
-});
-
-// Mount the Stremio addon (serves /manifest.json, /catalog/..., /meta/...).
-app.use(getRouter(addonInterface));
-
-app.listen(PORT, () => {
-  console.log(`ČSFD Ratings addon running on ${BASE_URL}`);
-  console.log(`Manifest:  ${BASE_URL}/manifest.json`);
-});
+module.exports = builder.getInterface();
+module.exports.manifest = manifest;

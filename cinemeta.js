@@ -1,96 +1,93 @@
 'use strict';
 
-const sharp = require('sharp');
+const { CINEMETA, TTL_CATALOG, TTL_META } = require('./config');
+const { TTLCache } = require('./cache');
 
-/**
- * ČSFD-style colour coding:
- *   good    (>= 70%) -> red    (ČSFD's signature "red" rating)
- *   average (30-69%) -> blue
- *   bad     (< 30%)  -> dark grey/black
- */
-function ratingColor(rating) {
-  if (rating >= 70) return '#b81e1e';
-  if (rating >= 30) return '#1f5f99';
-  return '#3a3a3a';
+const catalogCache = new TTLCache(500);
+const metaCache = new TTLCache(8000);
+
+// Lightweight info we keep so the poster endpoint can resolve title/year/poster
+// for any id we've seen, without re-hitting Cinemeta. id -> {type,title,year,poster}
+const infoCache = new TTLCache(20000);
+
+function rememberInfo(type, m) {
+  if (!m || !m.id) return;
+  infoCache.set(m.id, {
+    type,
+    title: m.name || m.title,
+    year: parseYear(m.year || m.releaseInfo),
+    poster: m.poster,
+  }, TTL_META);
 }
 
-function escapeXml(s) {
-  return String(s).replace(/[<>&'"]/g, (c) => ({
-    '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;',
-  }[c]));
+function parseYear(v) {
+  if (!v) return null;
+  const match = String(v).match(/\d{4}/);
+  return match ? parseInt(match[0], 10) : null;
 }
 
-/**
- * Build an SVG overlay (same dimensions as the poster) with a rounded
- * rating pill in the top-left corner, plus a small "ČSFD" label.
- */
-function buildBadgeSvg(width, height, rating) {
-  // Scale the badge to the poster width so it looks right at any resolution.
-  const pad = Math.round(width * 0.04);
-  const fontSize = Math.round(width * 0.16);
-  const labelSize = Math.round(width * 0.052);
-  const pillH = Math.round(fontSize * 1.18);
-  const text = `${Math.round(rating)}%`;
-  // Rough width estimate for the pill (digits are ~0.62em wide here).
-  const textW = text.length * fontSize * 0.6;
-  const pillW = Math.round(textW + pad * 1.6);
-  const x = pad;
-  const y = pad;
-  const color = ratingColor(rating);
-  const textY = y + pillH * 0.5;
-
-  return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>
-<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
-     xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <filter id="sh" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="${Math.max(1, Math.round(width*0.006))}"
-                    stdDeviation="${Math.max(1, Math.round(width*0.006))}"
-                    flood-color="#000" flood-opacity="0.55"/>
-    </filter>
-  </defs>
-  <g filter="url(#sh)" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
-    <rect x="${x}" y="${y}" rx="${Math.round(pillH*0.22)}" ry="${Math.round(pillH*0.22)}"
-          width="${pillW}" height="${pillH}" fill="${color}" fill-opacity="0.95"/>
-    <text x="${x + pillW/2}" y="${textY}" fill="#ffffff"
-          font-size="${fontSize}" font-weight="700"
-          text-anchor="middle" dominant-baseline="central">${escapeXml(text)}</text>
-    <text x="${x + pad*0.4}" y="${y + pillH + labelSize*1.15}" fill="#ffffff"
-          font-size="${labelSize}" font-weight="700" letter-spacing="1"
-          stroke="#000" stroke-width="${Math.max(1,Math.round(width*0.0035))}"
-          paint-order="stroke">ČSFD</text>
-  </g>
-</svg>`);
-}
-
-/**
- * Fetch the original poster, composite the rating badge, return a JPEG buffer.
- * @param {string} originalUrl  URL of the original poster (from Cinemeta).
- * @param {number} rating       ČSFD rating 0-100, or null for "no rating".
- * @param {number} targetWidth  Resize width (keeps aspect ratio). Default 500.
- */
-async function buildPoster(originalUrl, rating, targetWidth = 500) {
-  const res = await fetch(originalUrl, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (csfd-stremio-addon)' },
-  });
-  if (!res.ok) throw new Error(`poster fetch ${res.status}`);
-  const input = Buffer.from(await res.arrayBuffer());
-
-  let img = sharp(input).resize({ width: targetWidth, withoutEnlargement: false });
-  const meta = await img.metadata();
-  const w = meta.width || targetWidth;
-  const h = meta.height || Math.round(targetWidth * 1.5);
-
-  // If we have no rating, just return the (resized) original poster untouched.
-  if (rating === null || rating === undefined || Number.isNaN(rating)) {
-    return img.jpeg({ quality: 88 }).toBuffer();
+function buildExtraSuffix(extra) {
+  if (!extra) return '';
+  const parts = [];
+  for (const key of ['genre', 'search', 'skip']) {
+    if (extra[key] !== undefined && extra[key] !== null && extra[key] !== '') {
+      parts.push(`${key}=${encodeURIComponent(extra[key])}`);
+    }
   }
-
-  const svg = buildBadgeSvg(w, h, rating);
-  return img
-    .composite([{ input: svg, top: 0, left: 0 }])
-    .jpeg({ quality: 88 })
-    .toBuffer();
+  return parts.length ? '/' + parts.join('&') : '';
 }
 
-module.exports = { buildPoster, buildBadgeSvg, ratingColor };
+async function getJson(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'csfd-stremio-addon' },
+  });
+  if (!res.ok) throw new Error(`cinemeta ${res.status} ${url}`);
+  return res.json();
+}
+
+/** Fetch a Cinemeta catalog (e.g. type=movie, id=top). Returns {metas:[...]}. */
+async function getCatalog(type, cinemetaId, extra) {
+  const suffix = buildExtraSuffix(extra);
+  const url = `${CINEMETA}/catalog/${type}/${cinemetaId}${suffix}.json`;
+  const cached = catalogCache.get(url);
+  if (cached) return cached;
+  const data = await getJson(url);
+  const metas = Array.isArray(data.metas) ? data.metas : [];
+  for (const m of metas) rememberInfo(type, m);
+  const result = { metas };
+  catalogCache.set(url, result, TTL_CATALOG);
+  return result;
+}
+
+/** Fetch a single Cinemeta meta. Returns the meta object or null. */
+async function getMeta(type, id) {
+  const key = `${type}:${id}`;
+  const cached = metaCache.get(key);
+  if (cached !== undefined) return cached;
+  let meta = null;
+  try {
+    const data = await getJson(`${CINEMETA}/meta/${type}/${id}.json`);
+    meta = data && data.meta ? data.meta : null;
+  } catch (_) {
+    meta = null;
+  }
+  if (meta) rememberInfo(type, meta);
+  metaCache.set(key, meta, TTL_META);
+  return meta;
+}
+
+/** Best-effort title/year/poster for an id (from cache, else Cinemeta). */
+async function getInfo(type, id) {
+  const cached = infoCache.get(id);
+  if (cached) return cached;
+  const meta = await getMeta(type, id);
+  if (!meta) return null;
+  return infoCache.get(id) || {
+    type,
+    title: meta.name,
+    year: parseYear(meta.year || meta.releaseInfo),
+    poster: meta.poster,
+  };
+}
+
+module.exports = { getCatalog, getMeta, getInfo, parseYear };

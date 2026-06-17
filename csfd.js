@@ -1,95 +1,124 @@
 'use strict';
 
-const { addonBuilder } = require('stremio-addon-sdk');
-const { BASE_URL } = require('./config');
-const cinemeta = require('./cinemeta');
-const { getRating } = require('./csfd');
+const { csfd } = require('node-csfd-api');
+const { TTLCache, createLimiter } = require('./cache');
+const { TTL_MAPPING, TTL_RATING, CSFD_CONCURRENCY } = require('./config');
 
-const pkg = require('../package.json');
+const mappingCache = new TTLCache(20000); // imdbId -> {csfdId,url} (or null = no match)
+const ratingCache = new TTLCache(20000);  // csfdId -> {rating,url}
+const limit = createLimiter(CSFD_CONCURRENCY);
 
-// Which Cinemeta catalog each of our catalogs mirrors.
-// Add more rows here to expose additional ČSFD-rated catalogs.
-const CATALOG_MAP = {
-  'csfd.top': 'top', // Cinemeta "Popular"
-};
+// --- title helpers -------------------------------------------------------
 
-const sharedExtra = [
-  { name: 'genre', isRequired: false },
-  { name: 'skip', isRequired: false },
-  { name: 'search', isRequired: false },
-];
-
-const manifest = {
-  id: 'community.csfd.ratings.posters',
-  version: pkg.version,
-  name: 'ČSFD Ratings',
-  description:
-    'Adds ČSFD (csfd.cz) ratings onto movie and series posters, in the style of rating-poster addons. ' +
-    'Mirrors Cinemeta catalogs and overlays the ČSFD percentage rating on each poster.',
-  logo: 'https://www.csfd.cz/favicon.ico',
-  resources: ['catalog', 'meta'],
-  types: ['movie', 'series'],
-  idPrefixes: ['tt'],
-  catalogs: [
-    { type: 'movie', id: 'csfd.top', name: 'ČSFD Popular', extra: sharedExtra },
-    { type: 'series', id: 'csfd.top', name: 'ČSFD Popular', extra: sharedExtra },
-  ],
-  behaviorHints: { configurable: false, configurationRequired: false },
-};
-
-const builder = new addonBuilder(manifest);
-
-function posterUrl(type, id) {
-  return `${BASE_URL}/poster/${type}/${encodeURIComponent(id)}.jpg`;
+function norm(s) {
+  return String(s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // strip diacritics
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
 }
 
-// --- Catalog ----------------------------------------------------------------
-// Fast: we only rewrite poster URLs to point at our renderer. The actual ČSFD
-// lookup + composite happens lazily when Stremio requests each poster image.
-builder.defineCatalogHandler(async ({ type, id, extra }) => {
-  const cinemetaId = CATALOG_MAP[id];
-  if (!cinemetaId) return { metas: [] };
+function tokenJaccard(a, b) {
+  const A = new Set(a.split(' ').filter(Boolean));
+  const B = new Set(b.split(' ').filter(Boolean));
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter);
+}
 
-  const { metas } = await cinemeta.getCatalog(type, cinemetaId, extra);
-  const out = metas.map((m) => ({
-    ...m,
-    poster: m.id && m.id.startsWith('tt') ? posterUrl(type, m.id) : m.poster,
-    posterShape: 'poster',
-  }));
-  return { metas: out };
-});
+function titleScore(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.8;
+  return tokenJaccard(a, b);
+}
 
-// --- Meta -------------------------------------------------------------------
-// On the detail page we can afford one ČSFD lookup: rewrite the poster and add
-// the rating + a link to the ČSFD page into the description.
-builder.defineMetaHandler(async ({ type, id }) => {
-  const meta = await cinemeta.getMeta(type, id);
-  if (!meta) return { meta: null };
+// CSFD film types that count as a movie vs a series.
+const MOVIE_TYPES = new Set(['film', 'tv-film', 'theatrical', 'student-film', 'amateur-film', 'video-compilation']);
+const SERIES_TYPES = new Set(['series', 'tv-show', 'season']);
 
-  const year = cinemeta.parseYear(meta.year || meta.releaseInfo);
-  let rating = null;
-  let url = null;
-  try {
-    const r = await getRating(type, id, meta.name, year);
-    rating = r.rating;
-    url = r.url;
-  } catch (_) { /* fall back to plain meta */ }
+/** Choose the best ČSFD search result for a given title/year/stremioType. */
+function pickBest(search, stremioType, title, year) {
+  const wanted = norm(title);
+  const pool = []
+    .concat(search.movies || [])
+    .concat(search.tvSeries || []);
 
-  const enriched = {
-    ...meta,
-    poster: posterUrl(type, id),
-  };
-
-  if (rating !== null && rating !== undefined) {
-    const line = `★ ČSFD: ${Math.round(rating)} %`;
-    enriched.description = `${line}\n\n${meta.description || ''}`.trim();
-    enriched.links = [
-      ...(meta.links || []),
-      ...(url ? [{ name: `ČSFD ${Math.round(rating)} %`, category: 'ČSFD', url }] : []),
-    ];
+  let best = null;
+  let bestScore = -Infinity;
+  for (const c of pool) {
+    const typeOk =
+      stremioType === 'series'
+        ? SERIES_TYPES.has(c.type)
+        : MOVIE_TYPES.has(c.type);
+    let score = titleScore(norm(c.title), wanted);
+    // year proximity is a strong disambiguator
+    if (year && c.year) {
+      const d = Math.abs(c.year - year);
+      score += d === 0 ? 0.5 : d === 1 ? 0.25 : d <= 3 ? 0 : -0.6;
+    }
+    score += typeOk ? 0.35 : -0.35;
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
   }
-  return { meta: enriched };
-});
+  // require a reasonable match to avoid wildly wrong ratings
+  if (best && bestScore >= 0.6) return best;
+  return null;
+}
 
-module.exports = builder.getInterface();
-module.exports.manifest = manifest;
+// --- public API ----------------------------------------------------------
+
+/**
+ * Resolve a ČSFD numeric rating (0-100) for an IMDb item.
+ * @returns {Promise<{rating:number|null, url:string|null}>}
+ */
+async function getRating(stremioType, imdbId, title, year) {
+  // 1) imdb -> csfd id (cached, basically permanent)
+  let mapping = mappingCache.get(imdbId);
+  if (mapping === undefined) {
+    mapping = await limit(async () => {
+      // re-check inside the limiter in case another caller resolved it
+      const again = mappingCache.get(imdbId);
+      if (again !== undefined) return again;
+      try {
+        const search = await csfd.search(title);
+        const best = pickBest(search, stremioType, title, year);
+        const m = best ? { csfdId: best.id, url: best.url } : null;
+        mappingCache.set(imdbId, m, TTL_MAPPING);
+        return m;
+      } catch (e) {
+        // transient failure: cache the miss briefly so we retry later
+        mappingCache.set(imdbId, null, 1000 * 60 * 10);
+        return null;
+      }
+    });
+  }
+  if (!mapping) return { rating: null, url: null };
+
+  // 2) csfd id -> numeric rating (cached, medium TTL)
+  let rated = ratingCache.get(mapping.csfdId);
+  if (rated === undefined) {
+    rated = await limit(async () => {
+      const again = ratingCache.get(mapping.csfdId);
+      if (again !== undefined) return again;
+      try {
+        const movie = await csfd.movie(mapping.csfdId);
+        const r = typeof movie.rating === 'number' ? movie.rating : null;
+        const val = { rating: r, url: movie.url || mapping.url };
+        ratingCache.set(mapping.csfdId, val, TTL_RATING);
+        return val;
+      } catch (e) {
+        ratingCache.set(mapping.csfdId, { rating: null, url: mapping.url }, 1000 * 60 * 10);
+        return { rating: null, url: mapping.url };
+      }
+    });
+  }
+  return rated;
+}
+
+module.exports = { getRating, _norm: norm, _pickBest: pickBest };
