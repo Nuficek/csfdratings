@@ -5,7 +5,7 @@ const { BASE_URL } = require('./config');
 const cinemeta = require('./cinemeta');
 const { getRating } = require('./csfd');
 
-const pkg = require('../package.json');
+const pkg = require('./package.json');
 
 // Which Cinemeta catalog each of our catalogs mirrors.
 // Add more rows here to expose additional ČSFD-rated catalogs.
