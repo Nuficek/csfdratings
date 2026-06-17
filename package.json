@@ -1,0 +1,19 @@
+{
+  "name": "csfd-stremio-ratings",
+  "version": "1.0.0",
+  "description": "Stremio addon that overlays ČSFD (csfd.cz) ratings onto movie and series posters.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.2.1",
+    "node-csfd-api": "^5.10.2",
+    "sharp": "^0.35.1",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}

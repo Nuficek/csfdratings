@@ -1,0 +1,18 @@
+# Render Blueprint — deploy with one click from a Git repo.
+# In Render: New + → Blueprint → pick your repo. BASE_URL is auto-detected
+# from RENDER_EXTERNAL_URL, so there is nothing else to configure.
+services:
+  - type: web
+    name: csfd-stremio
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Be gentle to csfd.cz from a shared datacenter IP.
+      - key: CSFD_CONCURRENCY
+        value: "2"
